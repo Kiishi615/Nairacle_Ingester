@@ -304,14 +304,23 @@ def is_visited(url):
 
 
 def mark_visited(url):
+    """Add URL to in-memory set only (for pagination control during scrape).
+    File is written later by persist_visited_urls() after pipeline succeeds."""
     with seen_lock:
-        if url not in seen:
-            seen.add(url)
-            try:
-                with open(VISITED_FILE, "a", encoding="utf-8") as f:
-                    f.write(url + "\n")
-            except OSError as e:
-                log.error("Failed to write to %s: %s", VISITED_FILE, e)
+        seen.add(url)
+
+
+def persist_visited_urls():
+    """Write the full visited set to disk. Called ONLY after pipeline success."""
+    with seen_lock:
+        urls = sorted(seen)
+    try:
+        with open(VISITED_FILE, "w", encoding="utf-8") as f:
+            for url in urls:
+                f.write(url + "\n")
+        log.info("Persisted %d visited URLs to %s", len(urls), VISITED_FILE.name)
+    except OSError as e:
+        log.error("Failed to persist visited URLs: %s", e)
 
 
 def increment_count():
@@ -1374,6 +1383,9 @@ def main():
 
     kept = run_classify(limit=args.limit)
     run_upsert(kept)
+
+    # Only persist visited URLs after everything succeeds
+    persist_visited_urls()
 
     write_report(time.time() - start)
 

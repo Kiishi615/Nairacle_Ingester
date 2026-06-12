@@ -61,7 +61,7 @@ jobs:
             ./logs/daily_ingest.log
 
       - name: Save visited_urls.txt
-        if: success()
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ./visited_urls.txt
