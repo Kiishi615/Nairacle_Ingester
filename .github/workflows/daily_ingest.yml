@@ -1,9 +1,9 @@
 name: Daily Ingestion Pipeline
 
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch: # Manual trigger
   schedule:
-    - cron: '0 19 * * *'  # Every day at 7:00 PM UTC (8:00 PM WAT)
+    - cron: "0 19 * * *" # Every day at 7:00 PM UTC (8:00 PM WAT)
 
 env:
   GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -28,7 +28,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        working-directory: day04-Final_Project
+        working-directory: .
         run: |
           pip install --upgrade pip
           pip install playwright pydantic python-dotenv \
@@ -40,13 +40,13 @@ jobs:
       - name: Restore visited_urls.txt
         uses: actions/cache@v4
         with:
-          path: day04-Final_Project/visited_urls.txt
+          path: ./visited_urls.txt
           key: visited-urls-${{ github.run_id }}
           restore-keys: |
             visited-urls-
 
       - name: Run pipeline
-        working-directory: day04-Final_Project
+        working-directory: .
         run: python daily_ingest.py
 
       - name: Upload pipeline report
@@ -55,14 +55,14 @@ jobs:
         with:
           name: pipeline-report
           path: |
-            day04-Final_Project/pipeline_report.json
-            day04-Final_Project/scraped_today.jsonl
-            day04-Final_Project/classified_today.jsonl
-            day04-Final_Project/logs/daily_ingest.log
+            ./pipeline_report.json
+            ./scraped_today.jsonl
+            ./classified_today.jsonl
+            ./logs/daily_ingest.log
 
       - name: Save visited_urls.txt
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: day04-Final_Project/visited_urls.txt
+          path: ./visited_urls.txt
           key: visited-urls-${{ github.run_id }}
