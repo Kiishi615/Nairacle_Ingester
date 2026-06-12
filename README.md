@@ -10,9 +10,9 @@ your-repo/
 ├── .github/
 │   └── workflows/
 │       └── daily_ingest.yml      ← Workflow (cron 8 PM WAT + manual trigger)
-├── day04-Final_Project/
-│   ├── daily_ingest.py           ← Pipeline script (standalone, 1326 lines)
-│   └── menu_links.json           ← Category URLs to scrape (4 categories)
+├── daily_ingest.py               ← Pipeline script (standalone, 1326 lines)
+├── menu_links.json               ← Category URLs to scrape
+└── test_telegram.py              ← Quick Telegram bot test
 ```
 
 ## What each file does
@@ -31,7 +31,7 @@ your-repo/
 | OPENAI_API_KEY | OpenAI API key (for embeddings) |
 | PINECONE_API_KEY | Pinecone API key |
 | PINECONE_INDEX_NAME | Pinecone index name |
-| TELEGRAM_BOT_TOKEN | Telegram bot token from BotFather |
+| TELEGRAM_API_KEY | Telegram bot token from BotFather |
 | TELEGRAM_CHAT_ID | Your Telegram chat ID |
 
 ## Nothing else is needed
