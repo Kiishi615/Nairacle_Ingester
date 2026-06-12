@@ -33,7 +33,7 @@ jobs:
           pip install --upgrade pip
           pip install playwright pydantic python-dotenv \
                     langchain langchain-core langchain-google-genai \
-                    openai pinecone-client
+                    openai pinecone
           playwright install firefox
           playwright install-deps firefox
 
