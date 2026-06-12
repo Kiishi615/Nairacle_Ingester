@@ -90,6 +90,13 @@ ENV_PATH = PROJECT_DIR.parent / ".env"
 load_dotenv(ENV_PATH, override=True)
 load_dotenv(PROJECT_DIR / ".env", override=True)
 
+# Strip whitespace/newlines from secrets (GitHub Secrets copy-paste artefact)
+for _key in ("GOOGLE_API_KEY", "OPENAI_API_KEY", "PINECONE_API_KEY",
+             "PINECONE_INDEX_NAME", "TELEGRAM_API_KEY", "TELEGRAM_CHAT_ID"):
+    _val = os.environ.get(_key)
+    if _val:
+        os.environ[_key] = _val.strip()
+
 INPUT_FILE = PROJECT_DIR / "menu_links.json"
 VISITED_FILE = PROJECT_DIR / "visited_urls.txt"
 MASTER_FILE = PROJECT_DIR / "nairametrics_articles.jsonl"
