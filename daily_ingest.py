@@ -106,6 +106,7 @@ MAX_BACKFILL_RETRIES = 3
 
 CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "google_genai:gemini-3.1-flash-lite")
 CLASSIFY_DELAY = 4.5  # seconds between calls (rate-limit safe for free tier)
+CLASSIFY_MAX_RETRIES = 3  # retries per article on rate-limit / transient errors
 EMBED_BATCH_SIZE = 100
 
 # ── Selectors (easy to update when the site changes) ─────────────
@@ -221,6 +222,51 @@ BLOCKED_URL_PATTERNS = {
     "adservice.google",
     "google.com/ads",
 }
+
+
+def preflight_check():
+    """Validate credentials before spending 20+ min scraping."""
+    log.info("Preflight: checking credentials...")
+    errors = []
+
+    # Check env vars exist
+    required = {
+        "GOOGLE_API_KEY": "Gemini classification",
+        "OPENAI_API_KEY": "OpenAI embeddings",
+        "PINECONE_API_KEY": "Pinecone vector store",
+        "PINECONE_INDEX_NAME": "Pinecone index",
+    }
+    for key, purpose in required.items():
+        if not os.environ.get(key):
+            errors.append(f"{key} is missing (needed for {purpose})")
+
+    if errors:
+        for e in errors:
+            log.critical("PREFLIGHT FAIL: %s", e)
+        sys.exit(1)
+
+    # Quick Pinecone connection test
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        index = pc.Index(name=os.environ["PINECONE_INDEX_NAME"])
+        stats = index.describe_index_stats()
+        log.info("Preflight: Pinecone OK (%d vectors)", stats.total_vector_count)
+    except Exception as e:
+        log.critical("PREFLIGHT FAIL: Pinecone connection failed: %s", e)
+        sys.exit(1)
+
+    # Quick OpenAI connection test
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        client.models.list()
+        log.info("Preflight: OpenAI OK")
+    except Exception as e:
+        log.critical("PREFLIGHT FAIL: OpenAI connection failed: %s", e)
+        sys.exit(1)
+
+    log.info("Preflight: all credentials valid")
 
 # ═══════════════════════════════════════════════════════════════════
 #  SHARED STATE & HELPERS
@@ -858,38 +904,48 @@ def run_clean():
 
 
 def _classify_one(chain, article: dict) -> dict | None:
-    """Classify a single article. Returns enriched dict or None."""
+    """Classify a single article with retry on rate-limit errors."""
     content = (article.get("content") or "").strip()
     title = (article.get("title") or "").strip()
 
     if not content or len(content) < 50:
         return None
 
-    try:
-        result: ArticleClassification = chain.invoke(
-            {
-                "title": title,
-                "content": content,
-            }
-        )
+    short = title[:60] + "..." if len(title) > 60 else title
 
-        short = title[:60] + "..." if len(title) > 60 else title
-        if result.decision == "keep" and result.summary:
-            log.info("  KEEP: %s", short)
-            log.info("    Summary: %s", result.summary[:120])
-            return {
-                "url": article["url"],
-                "title": title,
-                "date": normalize_date(article.get("date", "")),
-                "categories": article.get("categories", []),
-                "summary": result.summary,
-            }
-        log.info("  DISCARD: %s", short)
-        return None
+    for attempt in range(1, CLASSIFY_MAX_RETRIES + 1):
+        try:
+            result: ArticleClassification = chain.invoke(
+                {
+                    "title": title,
+                    "content": content,
+                }
+            )
 
-    except Exception as e:
-        log.error("Classification failed for %s: %s", article.get("url", "?"), e)
-        return None
+            if result.decision == "keep" and result.summary:
+                log.info("  KEEP: %s", short)
+                log.info("    Summary: %s", result.summary[:120])
+                return {
+                    "url": article["url"],
+                    "title": title,
+                    "date": normalize_date(article.get("date", "")),
+                    "categories": article.get("categories", []),
+                    "summary": result.summary,
+                }
+            log.info("  DISCARD: %s", short)
+            return None
+
+        except Exception as e:
+            err_str = str(e).lower()
+            is_retryable = any(k in err_str for k in ("429", "rate", "resource_exhausted", "quota", "503", "overloaded"))
+            if is_retryable and attempt < CLASSIFY_MAX_RETRIES:
+                wait = CLASSIFY_DELAY * (2 ** attempt)
+                log.warning("  Rate-limited on %s (attempt %d/%d), waiting %.0fs...",
+                            short, attempt, CLASSIFY_MAX_RETRIES, wait)
+                time.sleep(wait)
+                continue
+            log.error("Classification failed for %s: %s", article.get("url", "?"), e)
+            return None
 
 
 def run_classify(limit: int | None = None):
@@ -1303,6 +1359,7 @@ def main():
     log.info("+" + "=" * 58 + "+")
 
     if not args.classify_only:
+        preflight_check()
         run_scrape()
         
     run_backfill()
