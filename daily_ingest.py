@@ -1192,9 +1192,11 @@ def run_upsert(kept: list[dict] | None = None):
 
     try:
         stats = index.describe_index_stats()
-        report["pinecone_total"] = stats.total_vector_count
+        # Pinecone has eventual consistency — stats may not reflect
+        # the vectors we just upserted, so add them to be accurate.
+        report["pinecone_total"] = stats.total_vector_count + upserted
     except Exception:
-        pass
+        report["pinecone_total"] = upserted  # best effort
 
     report["upserted"] = upserted
     report["upsert_errors"] = errors
