@@ -19,7 +19,7 @@ your-repo/
 
 | File | Purpose |
 |:-----|:--------|
-| `daily_ingest.yml` | GitHub Actions workflow — installs deps, runs pipeline, caches visited_urls.txt, uploads artifacts, passes secrets as env vars |
+| `daily_ingest.yml` | GitHub Actions workflow — installs deps, runs pipeline, commits confirmed visited URLs, uploads artifacts, passes secrets as env vars |
 | `daily_ingest.py` | The full pipeline — scrape, backfill, clean, classify (Gemini), upsert (Pinecone), report + Telegram notification |
 | `menu_links.json` | List of Nairametrics category URLs to scrape |
 
@@ -36,6 +36,25 @@ your-repo/
 
 ## Nothing else is needed
 
-- visited_urls.txt → handled by Actions cache (persists between runs)
+- visited_urls.txt → tracked in this repository; updated after confirmed Pinecone ingestion
 - nairametrics_articles.jsonl → not needed, Pinecone IS the archive
 - scraped_today.jsonl, classified_today.jsonl, logs → created at runtime, uploaded as artifacts
+
+## Visited history and recovery
+
+The committed `visited_urls.txt` is the source of history for each run. Scraping a
+URL only marks it seen in memory for that run. A URL is added to the physical file
+only after Pinecone acknowledges its upload, or a fetch confirms it already exists.
+An explicit discard ends the current attempt without adding a visited entry.
+Failed articles stay pending. A missing or invalid model reply counts as a failure.
+
+Each confirmed upload batch checkpoints the file with an atomic replacement.
+Only confirmed uploads enter the local master file or leave the pending article
+file. The workflow backs up the visited file and pending article records in the
+run's `ingestion-state` artifact. It publishes `visited_urls.txt` and
+`retry_urls.txt` on the default branch, including when a later pipeline step
+fails and the runner can still execute the publication step. Each daily run
+reloads pending URLs from the repository and fetches their article text again.
+Repository rules must permit the workflow's `GITHUB_TOKEN` to update both files.
+
+Git history preserves the list beyond artifact retention.

@@ -4,7 +4,7 @@ Standalone daily ingestion pipeline — Scrape → Backfill → Clean → Classi
 Orchestrates the full daily workflow with updated Nairametrics selectors:
   1. Scrape new articles (multithreaded Playwright, new 3-section layout)
   2. Backfill articles with missing content (3 retries)
-  3. Remove articles that still fail after retries
+  3. Keep articles that still fail in the retry queue
   4. Deduplicate by URL
   5. Clean boilerplate from content
   6. Classify with Gemini 3.1 Flash-Lite (structured output)
@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -99,6 +100,7 @@ for _key in ("GOOGLE_API_KEY", "OPENAI_API_KEY", "PINECONE_API_KEY",
 
 INPUT_FILE = PROJECT_DIR / "menu_links.json"
 VISITED_FILE = PROJECT_DIR / "visited_urls.txt"
+RETRY_FILE = PROJECT_DIR / "retry_urls.txt"
 MASTER_FILE = PROJECT_DIR / "nairametrics_articles.jsonl"
 SCRAPED_FILE = PROJECT_DIR / "scraped_today.jsonl"
 CLASSIFIED_FILE = PROJECT_DIR / "classified_today.jsonl"
@@ -311,23 +313,35 @@ def is_visited(url):
 
 
 def mark_visited(url):
-    """Add URL to in-memory set only (for pagination control during scrape).
-    File is written later by persist_visited_urls() after pipeline succeeds."""
+    """Avoid repeat scraping within this run; this is NOT an ingestion receipt."""
     with seen_lock:
         seen.add(url)
 
 
-def persist_visited_urls():
-    """Write the full visited set to disk. Called ONLY after pipeline success."""
-    with seen_lock:
-        urls = sorted(seen)
+def persist_visited_urls(confirmed_urls):
+    """Add only database-confirmed URLs, preserving the committed history atomically."""
+    confirmed_urls = set(confirmed_urls)
+    if not confirmed_urls:
+        return
+    # Fail closed if the existing history is missing; never manufacture a baseline.
+    existing = set(VISITED_FILE.read_text(encoding="utf-8").splitlines())
+    urls = sorted(existing | confirmed_urls)
+    temporary = None
     try:
-        with open(VISITED_FILE, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            dir=VISITED_FILE.parent, prefix=".visited-", delete=False,
+        ) as f:
+            temporary = Path(f.name)
             for url in urls:
                 f.write(url + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, VISITED_FILE)
         log.info("Persisted %d visited URLs to %s", len(urls), VISITED_FILE.name)
-    except OSError as e:
-        log.error("Failed to persist visited URLs: %s", e)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def increment_count():
@@ -374,11 +388,10 @@ def goto_with_retry(page, url, retries=MAX_RETRIES):
 
 def write_scraped(entry: dict):
     with write_lock:
-        try:
-            with open(SCRAPED_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except OSError as e:
-            log.error("Write failed: %s", e)
+        with open(SCRAPED_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def load_visited_urls() -> set:
@@ -516,26 +529,52 @@ def clean_content(text: str) -> str:
 
 
 def load_scraped() -> list[dict]:
-    """Load scraped_today.jsonl into a list."""
-    entries = []
+    """Use the latest snapshot for each URL in the pending file."""
+    entries = {}
     if not SCRAPED_FILE.exists():
-        return entries
+        return []
     for line in SCRAPED_FILE.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    return entries
+        entry = json.loads(line)
+        entries[entry["url"]] = entry
+    return list(entries.values())
 
 
 def save_scraped(entries: list[dict]):
-    """Rewrite scraped_today.jsonl from list."""
-    with open(SCRAPED_FILE, "w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    """Checkpoint pending work without risking a half-written replacement."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            dir=SCRAPED_FILE.parent, prefix=".pending-", delete=False,
+        ) as f:
+            temporary = Path(f.name)
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, SCRAPED_FILE)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def pending_article(url, title=""):
+    return {"url": url, "title": title, "content": "", "date": "",
+            "categories": [], "needs_backfill": True}
+
+
+def restore_pending_articles():
+    """Merge the repository retry URLs with any local pending article records."""
+    entries = {entry["url"]: entry for entry in load_scraped()}
+    if RETRY_FILE.exists():
+        for url in RETRY_FILE.read_text(encoding="utf-8").splitlines():
+            if url:
+                entries.setdefault(url, pending_article(url))
+    complete = set(VISITED_FILE.read_text(encoding="utf-8").splitlines())
+    save_scraped([entry for url, entry in entries.items() if url not in complete])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -596,13 +635,15 @@ def scrape_worker(thread_id: int):
 
                 log.info("%s  -> %s", tag, item["title"][:60])
 
+                # Checkpoint the URL before navigation or parsing can fail.
+                write_scraped(pending_article(href, item["title"]))
                 if not goto_with_retry(page, href, retries=2):
                     continue
                 time.sleep(PAGE_DELAY)
 
                 article_title = collector(page, SELECTORS["article_title"])
                 article_content = collector(page, SELECTORS["article_content"])
-                needs_backfill = not article_content
+                needs_backfill = len((article_content or "").strip()) < 50
 
                 article_date = collector(page, SELECTORS["article_date"])
                 if not article_date:
@@ -660,7 +701,6 @@ def run_scrape():
 
     seen = load_visited_urls()
     new_count = 0
-    SCRAPED_FILE.write_text("", encoding="utf-8")
 
     try:
         content = json.loads(INPUT_FILE.read_text(encoding="utf-8"))
@@ -778,7 +818,7 @@ def run_backfill():
                 continue
             time.sleep(PAGE_DELAY)
 
-            if not (entry.get("content") or "").strip():
+            if len((entry.get("content") or "").strip()) < 50:
                 content = collector(page, SELECTORS["article_content"], timeout=8000)
                 if content:
                     entries[idx]["content"] = content
@@ -808,7 +848,7 @@ def run_backfill():
             e = entries[idx]
             all_filled = all(
                 [
-                    (e.get("content") or "").strip(),
+                    len((e.get("content") or "").strip()) >= 50,
                     (e.get("title") or "").strip(),
                     (e.get("date") or "").strip(),
                     e.get("categories"),
@@ -832,31 +872,24 @@ def run_backfill():
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  STAGE 3: REMOVE FAILURES
+#  STAGE 3: REPORT PENDING BACKFILL
 # ═══════════════════════════════════════════════════════════════════
 
 
-def run_remove_failures():
+def report_backfill_failures():
     log.info("=" * 60)
-    log.info("STAGE 3: REMOVE BACKFILL FAILURES")
+    log.info("STAGE 3: REPORT PENDING BACKFILL")
     log.info("=" * 60)
 
     entries = load_scraped()
-    before = len(entries)
     failures = [e for e in entries if e.get("needs_backfill")]
 
     if not failures:
         log.info("No failures to remove")
         return
 
-    for f in failures:
-        log.warning("Removing failed article: %s", f.get("url", "?"))
-
-    kept = [e for e in entries if not e.get("needs_backfill")]
-    save_scraped(kept)
-    removed = before - len(kept)
-    report["backfill_failures"] = removed
-    log.info("REMOVED %d articles that failed backfill", removed)
+    report["backfill_failures"] = len(failures)
+    log.warning("Queued %d incomplete articles for retry", len(failures))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -919,13 +952,13 @@ def run_clean():
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _classify_one(chain, article: dict) -> dict | None:
+def _classify_one(chain, article: dict) -> tuple[str, dict | None]:
     """Classify a single article with retry on rate-limit errors."""
     content = (article.get("content") or "").strip()
     title = (article.get("title") or "").strip()
 
     if not content or len(content) < 50:
-        return None
+        return "retry", None
 
     short = title[:60] + "..." if len(title) > 60 else title
 
@@ -938,18 +971,21 @@ def _classify_one(chain, article: dict) -> dict | None:
                 }
             )
 
-            if result.decision == "keep" and result.summary:
+            if result.decision == "keep" and (result.summary or "").strip():
                 log.info("  KEEP: %s", short)
                 log.info("    Summary: %s", result.summary[:120])
-                return {
+                return "keep", {
                     "url": article["url"],
                     "title": title,
                     "date": normalize_date(article.get("date", "")),
                     "categories": article.get("categories", []),
                     "summary": result.summary,
                 }
-            log.info("  DISCARD: %s", short)
-            return None
+            if result.decision == "discard":
+                log.info("  DISCARD: %s", short)
+                return "discard", None
+            log.warning("Missing summary for kept article: %s", article["url"])
+            return "retry", None
 
         except Exception as e:
             err_str = str(e).lower()
@@ -961,7 +997,7 @@ def _classify_one(chain, article: dict) -> dict | None:
                 time.sleep(wait)
                 continue
             log.error("Classification failed for %s: %s", article.get("url", "?"), e)
-            return None
+            return "retry", None
 
 
 def run_classify(limit: int | None = None):
@@ -973,7 +1009,12 @@ def run_classify(limit: int | None = None):
         log.error("No scraped file found — run scrape first")
         return []
 
-    articles = load_scraped()
+    pending = load_scraped()
+    for article in pending:
+        if len((article.get("content") or "").strip()) < 50:
+            article["needs_backfill"] = True
+    save_scraped(pending)
+    articles = [article for article in pending if not article.get("needs_backfill")]
     if limit:
         articles = articles[:limit]
 
@@ -1006,7 +1047,7 @@ def run_classify(limit: int | None = None):
 
     # Sequential classification with rate limiting for free tier
     kept = []
-    discarded = 0
+    discarded_urls = set()
     errors = 0
     backoff = CLASSIFY_DELAY
 
@@ -1017,11 +1058,11 @@ def run_classify(limit: int | None = None):
             len(articles),
             (article.get("title") or "?")[:60],
         )
-        result = _classify_one(chain, article)
-        if result:
+        decision, result = _classify_one(chain, article)
+        if decision == "keep":
             kept.append(result)
-        elif result is None and (article.get("content") or "").strip():
-            discarded += 1
+        elif decision == "discard":
+            discarded_urls.add(article["url"])
         else:
             errors += 1
 
@@ -1031,7 +1072,7 @@ def run_classify(limit: int | None = None):
                 i,
                 len(articles),
                 len(kept),
-                discarded,
+                len(discarded_urls),
             )
 
         # Rate limiting with adaptive backoff
@@ -1044,12 +1085,14 @@ def run_classify(limit: int | None = None):
     log.info("Saved %d classified articles to %s", len(kept), CLASSIFIED_FILE.name)
 
     report["classified_keep"] = len(kept)
-    report["classified_discard"] = discarded
+    if discarded_urls:
+        save_scraped([article for article in pending if article["url"] not in discarded_urls])
+    report["classified_discard"] = len(discarded_urls)
     report["classify_errors"] = errors
     log.info(
         "CLASSIFY COMPLETE — %d kept, %d discarded, %d errors",
         len(kept),
-        discarded,
+        len(discarded_urls),
         errors,
     )
     return kept
@@ -1091,9 +1134,11 @@ def run_upsert(kept: list[dict] | None = None):
     pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
     index = pc.Index(name=os.environ["PINECONE_INDEX_NAME"])
 
-    # ── Pinecone-level dedup: normalize URLs and check what already exists ──
+    # Retain the scraper's exact URLs for its exact-match visited checks.
+    original_urls = {}
     for r in kept:
-        r["url"] = normalize_url(r["url"])
+        original_urls.setdefault(normalize_url(r["url"]), set()).add(r["url"])
+    kept = [dict(r, url=normalize_url(r["url"])) for r in kept]
 
     candidate_ids = [r["url"] for r in kept]
     existing_ids = set()
@@ -1101,23 +1146,24 @@ def run_upsert(kept: list[dict] | None = None):
         batch_ids = candidate_ids[i : i + 100]
         try:
             fetch_result = index.fetch(ids=batch_ids)
-            existing_ids.update(fetch_result.vectors.keys())
+            existing_ids.update(set(fetch_result.vectors.keys()) & set(batch_ids))
         except Exception as e:
             log.warning("Fetch-check failed (batch %d): %s — will upsert all", i // 100 + 1, e)
 
     if existing_ids:
+        persist_visited_urls(
+            url for record_id in existing_ids for url in original_urls[record_id]
+        )
         log.info("Skipping %d articles already in Pinecone", len(existing_ids))
         kept = [r for r in kept if r["url"] not in existing_ids]
         report["duplicates_skipped_pinecone"] = len(existing_ids)
-
-    if not kept:
-        log.info("All articles already exist in Pinecone — nothing to upsert")
-        return
 
     log.info("%d new articles to upsert after dedup", len(kept))
 
     upserted = 0
     errors = 0
+    completed_ids = set(existing_ids)
+    successful_records = []
 
     for i in range(0, len(kept), EMBED_BATCH_SIZE):
         batch = kept[i : i + EMBED_BATCH_SIZE]
@@ -1128,13 +1174,17 @@ def run_upsert(kept: list[dict] | None = None):
                 input=summaries,
                 model="text-embedding-3-small",
             )
+            embeddings = {item.index: item for item in response.data}
+            if set(embeddings) != set(range(len(batch))):
+                raise ValueError("Embedding response does not cover every article")
         except Exception as e:
             log.error("Embedding error at batch %d: %s", i // EMBED_BATCH_SIZE + 1, e)
             errors += len(batch)
             continue
 
         vectors = []
-        for record, emb_obj in zip(batch, response.data):
+        for position, record in enumerate(batch):
+            emb_obj = embeddings[position]
             vectors.append(
                 {
                     "id": record["url"],
@@ -1150,12 +1200,22 @@ def run_upsert(kept: list[dict] | None = None):
             )
 
         try:
-            index.upsert(vectors=vectors)
-            upserted += len(vectors)
+            result = index.upsert(vectors=vectors)
+            if result.upserted_count != len(vectors):
+                raise ValueError("Pinecone did not acknowledge every vector in the batch")
         except Exception as e:
             log.error("Upsert error: %s", e)
             errors += len(vectors)
             continue
+
+        # This checkpoint happens only after Pinecone acknowledges the whole batch.
+        # A failure to persist aborts processing while leaving the old file intact.
+        persist_visited_urls(
+            url for record in batch for url in original_urls[record["url"]]
+        )
+        completed_ids.update(record["url"] for record in batch)
+        successful_records.extend(batch)
+        upserted += len(vectors)
 
         log.info(
             "  Batch %d: %d/%d upserted", i // EMBED_BATCH_SIZE + 1, upserted, len(kept)
@@ -1174,7 +1234,7 @@ def run_upsert(kept: list[dict] | None = None):
 
     new_master = 0
     with open(MASTER_FILE, "a", encoding="utf-8") as f:
-        for r in kept:
+        for r in successful_records:
             if r["url"] not in master_urls:
                 entry = {
                     "title": r["title"],
@@ -1188,7 +1248,7 @@ def run_upsert(kept: list[dict] | None = None):
                 master_urls.add(r["url"])
                 new_master += 1
     log.info("Appended %d new entries to master JSONL (%d skipped as dupes)",
-             new_master, len(kept) - new_master)
+             new_master, len(successful_records) - new_master)
 
     try:
         stats = index.describe_index_stats()
@@ -1202,14 +1262,13 @@ def run_upsert(kept: list[dict] | None = None):
     report["upsert_errors"] = errors
     log.info("UPSERT COMPLETE — %d upserted, %d errors", upserted, errors)
 
-    # Remove only the articles that were successfully upserted
-    if upserted > 0:
-        upserted_urls = {r["url"] for r in kept}
-        remaining = [e for e in load_scraped() if normalize_url(e.get("url", "")) not in upserted_urls]
+    # Remove articles confirmed in Pinecone, including records from earlier runs.
+    if completed_ids:
+        remaining = [e for e in load_scraped() if normalize_url(e.get("url", "")) not in completed_ids]
         save_scraped(remaining)
         log.info(
             "Removed %d processed articles from %s (%d remaining)",
-            len(upserted_urls),
+            len(completed_ids),
             SCRAPED_FILE.name,
             len(remaining),
         )
@@ -1250,7 +1309,7 @@ def write_report(elapsed: float):
                 f.write(f"| Articles Scraped | {report['scraped']} |\n")
                 f.write(f"| Backfilled | {report['backfilled']} |\n")
                 f.write(
-                    f"| Backfill Failures (removed) | {report['backfill_failures']} |\n"
+                    f"| Backfill Failures (queued) | {report['backfill_failures']} |\n"
                 )
                 f.write(f"| Duplicates Removed | {report['duplicates_removed']} |\n")
                 f.write(f"| Classified: Keep | {report['classified_keep']} |\n")
@@ -1376,12 +1435,14 @@ def main():
     )
     log.info("+" + "=" * 58 + "+")
 
+    restore_pending_articles()
+
     if not args.classify_only:
         preflight_check()
         run_scrape()
         
     run_backfill()
-    run_remove_failures()
+    report_backfill_failures()
     run_dedup()
     run_clean()
 
@@ -1392,9 +1453,6 @@ def main():
 
     kept = run_classify(limit=args.limit)
     run_upsert(kept)
-
-    # Only persist visited URLs after everything succeeds
-    persist_visited_urls()
 
     write_report(time.time() - start)
 
