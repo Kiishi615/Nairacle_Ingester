@@ -113,7 +113,7 @@ NUM_THREADS = 4
 MAX_PAGES_PER_CATEGORY = 10
 MAX_BACKFILL_RETRIES = 3
 
-CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "google_genai:gemini-3.1-flash-lite")
+CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "google_genai:gemini-3.5-flash-lite")
 CLASSIFY_DELAY = 4.5  # seconds between calls (rate-limit safe for free tier)
 CLASSIFY_MAX_RETRIES = 3  # retries per article on rate-limit / transient errors
 EMBED_BATCH_SIZE = 100
@@ -363,10 +363,14 @@ def block_heavy_resources(page):
     page.route("**/*", _handle)
 
 
-def collector(page, tag, timeout=5000):
+def collector(page, tag, timeout=5000, first_only=False):
     try:
         page.wait_for_selector(tag, timeout=timeout)
-        contents = page.locator(tag).all_inner_texts()
+        locator = page.locator(tag)
+        if first_only:
+            text = locator.first.inner_text().strip()
+            return text if text else None
+        contents = locator.all_inner_texts()
         return " ".join(contents) if contents else None
     except Exception:
         return None
@@ -471,15 +475,51 @@ def normalize_url(url: str) -> str:
     return urlunparse(cleaned)
 
 
-def normalize_date(date_str: str) -> str:
-    if not date_str:
-        return date_str
-    for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
+MIN_ARTICLE_DATE = "2024-01-01"
+
+_URL_DATE_RE = re.compile(r"/(\d{4})/(\d{2})/(\d{2})/")
+_ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_MONTH_DATE_RE = re.compile(
+    r"\b("
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+    r"\.?\s+\d{1,2},\s+\d{4}"
+    r")\b"
+)
+
+
+def normalize_date(date_str: str, url: str = "") -> str:
+    """Return a clean YYYY-MM-DD date from the first date in *date_str* or *url*."""
+    raw = (date_str or "").strip()
+
+    # 1. Already contains YYYY-MM-DD
+    iso_match = _ISO_DATE_RE.search(raw)
+    if iso_match:
         try:
-            return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(iso_match.group(1), "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
-            continue
-    return date_str
+            pass
+
+    # 2. Extract only the FIRST month-name date (ignores related-story dates)
+    month_match = _MONTH_DATE_RE.search(raw)
+    if month_match:
+        token = month_match.group(1).replace("Sept", "Sep").replace(".", "")
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+    # 3. Fallback: extract /YYYY/MM/DD/ from the article URL
+    url_match = _URL_DATE_RE.search(url or "")
+    if url_match:
+        candidate = f"{url_match.group(1)}-{url_match.group(2)}-{url_match.group(3)}"
+        try:
+            return datetime.strptime(candidate, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    return raw
 
 
 def collect_listing_links(page):
@@ -645,9 +685,13 @@ def scrape_worker(thread_id: int):
                 article_content = collector(page, SELECTORS["article_content"])
                 needs_backfill = len((article_content or "").strip()) < 50
 
-                article_date = collector(page, SELECTORS["article_date"])
-                if not article_date:
-                    article_date = ""
+                raw_date = collector(page, SELECTORS["article_date"], first_only=True) or ""
+                article_date = normalize_date(raw_date, url=href)
+
+                if article_date and len(article_date) == 10 and article_date < MIN_ARTICLE_DATE:
+                    log.info("%s  Skipping pre-%s article (%s): %s", tag, MIN_ARTICLE_DATE, article_date, href)
+                    mark_visited(href)
+                    continue
 
                 categories_list = []
                 try:
@@ -829,9 +873,10 @@ def run_backfill():
                     entries[idx]["title"] = title
 
             if not (entry.get("date") or "").strip():
-                date = collector(page, SELECTORS["article_date"])
-                if date:
-                    entries[idx]["date"] = date
+                raw_date = collector(page, SELECTORS["article_date"], first_only=True) or ""
+                clean_date = normalize_date(raw_date, url=url)
+                if clean_date:
+                    entries[idx]["date"] = clean_date
 
             if not entry.get("categories"):
                 try:
@@ -977,7 +1022,7 @@ def _classify_one(chain, article: dict) -> tuple[str, dict | None]:
                 return "keep", {
                     "url": article["url"],
                     "title": title,
-                    "date": normalize_date(article.get("date", "")),
+                    "date": normalize_date(article.get("date", ""), url=article.get("url", "")),
                     "categories": article.get("categories", []),
                     "summary": result.summary,
                 }
